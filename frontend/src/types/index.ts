@@ -6,6 +6,7 @@ export interface VideoFormat {
   has_audio: boolean;
   has_video: boolean;
   note?: string;
+  height?: number;
 }
 
 export interface VideoMetadata {

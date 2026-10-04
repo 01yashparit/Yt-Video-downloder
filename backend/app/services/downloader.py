@@ -82,7 +82,7 @@ class DownloaderService:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(valid_url, download=False)
         except Exception as e:
-            err_msg = str(e)
+            err_msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
             logger.error(f"yt-dlp extract_info error for {valid_url}: {err_msg}")
             if "Private video" in err_msg:
                 raise DownloaderError("This video is private and cannot be downloaded.")
@@ -162,8 +162,10 @@ class DownloaderService:
             uploader=info.get('uploader') or info.get('channel'),
             formats=processed_formats
         )
-
+    
     def start_download_job(self, url: str, format_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_\-\.]{1,32}", format_id or ""):
+            raise DownloaderError("Invalid format ID.")
         valid_url = self.validate_url(url)
         job_id = str(uuid.uuid4())
 
@@ -204,13 +206,13 @@ class DownloaderService:
 
         def progress_hook(d):
             if d.get('status') == 'downloading':
-                downloaded = d.get('downloaded_bytes', 0)
-                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = int(d.get('downloaded_bytes') or 0)
+                total = int(d.get('total_bytes') or d.get('total_bytes_estimate') or 0)
                 speed_bytes = d.get('speed') or 0
 
                 percent = 0.0
                 if total > 0:
-                    percent = round((downloaded / total) * 100, 1)
+                    percent = min(100.0, round((downloaded / total) * 100, 1))
 
                 speed_str = "0 KB/s"
                 if speed_bytes:
@@ -287,7 +289,7 @@ class DownloaderService:
                     self.jobs[job_id]['filename'] = final_filename
 
         except Exception as e:
-            err_msg = str(e)
+            err_msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
             logger.error(f"Download execution failed for job {job_id}: {err_msg}")
             with self.jobs_lock:
                 if job_id in self.jobs:

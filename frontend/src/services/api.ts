@@ -1,6 +1,6 @@
 import type { HealthResponse, VideoMetadata, DownloadStatusResponse } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';;
 
 export async function checkHealth(): Promise<HealthResponse> {
   const response = await fetch(`${API_BASE_URL}/health`);
@@ -51,5 +51,9 @@ export async function getDownloadStatus(jobId: string): Promise<DownloadStatusRe
     throw new Error(errorData.detail || `Error getting status (${response.status})`);
   }
   return response.json();
+}
+
+export function getDownloadFileUrl(jobId: string): string {
+  return `${API_BASE_URL}/api/download/${jobId}/file`;
 }
 

@@ -75,11 +75,9 @@ export function App() {
       // Poll status every 1 second
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 
-      let pollFailures = 0;
       pollIntervalRef.current = window.setInterval(async () => {
         try {
           const statusRes = await getDownloadStatus(job_id);
-          pollFailures = 0;
           setDownloadProgress(statusRes.progress_percentage || 0);
           if (statusRes.speed) setDownloadSpeed(statusRes.speed);
 
@@ -93,8 +91,6 @@ export function App() {
             setErrorMessage(statusRes.error || 'Download failed during execution.');
           }
         } catch (pollErr: any) {
-          pollFailures += 1;
-          if (pollFailures < 5) return;
           if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
           setStatus('error');
           setErrorMessage(`Error polling download status: ${pollErr.message}`);
