@@ -1,8 +1,6 @@
 import os
 import re
 import shutil
-import socket
-import ipaddress
 import uuid
 import threading
 from urllib.parse import urlparse
@@ -21,7 +19,6 @@ class DownloaderService:
     def __init__(self):
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.jobs_lock = threading.Lock()
-        self.format_cache: Dict[str, set] = {}
         self._ensure_directories()
 
     def _ensure_directories(self):
@@ -38,29 +35,17 @@ class DownloaderService:
         cleaned_url = url.strip()
         try:
             parsed = urlparse(cleaned_url)
+            valid_hosts = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
             if parsed.scheme not in ("http", "https"):
                 raise DownloaderError("Invalid URL scheme. Must start with http:// or https://")
-            if not parsed.hostname:
-                raise DownloaderError("Invalid URL: missing website address.")
-            self._block_private_host(parsed.hostname)
+            if parsed.hostname is None or parsed.hostname.lower() not in valid_hosts:
+                raise DownloaderError("Unsupported domain. Only YouTube URLs are supported.")
         except DownloaderError:
             raise
         except Exception as e:
             raise DownloaderError(f"Invalid URL: {str(e)}")
 
         return cleaned_url
-
-    def _block_private_host(self, host: str):
-        """Refuse addresses on the local network so this server cannot be used to probe it."""
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            raise DownloaderError("Could not find that website. Check the link.")
-        for info in infos:
-            ip = ipaddress.ip_address(info[4][0].split("%")[0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-                    or ip.is_multicast or ip.is_unspecified):
-                raise DownloaderError("Links to private or local network addresses are not allowed.")
 
     def sanitize_filename(self, title: str) -> str:
         # Replace non-alphanumeric/spaces with underscores or hyphens
@@ -91,7 +76,6 @@ class DownloaderService:
             'no_warnings': True,
             'extract_flat': False,
             'skip_download': True,
-            'noplaylist': True,
         }
 
         try:
@@ -169,22 +153,20 @@ class DownloaderService:
             reverse=True
         )
 
-        self.format_cache[valid_url] = {f.format_id for f in processed_formats}
-
         return VideoInfoResponse(
-            id=info.get('id') or '',
+            id=info.get('id', ''),
             title=info.get('title', 'Unknown Title'),
             url=valid_url,
-            thumbnail=info.get('thumbnail') or '',
+            thumbnail=info.get('thumbnail', ''),
             duration=int(info.get('duration') or 0),
             uploader=info.get('uploader') or info.get('channel'),
             formats=processed_formats
         )
     
     def start_download_job(self, url: str, format_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_\-\.]{1,32}", format_id or ""):
+            raise DownloaderError("Invalid format ID.")
         valid_url = self.validate_url(url)
-        if format_id not in self.format_cache.get(valid_url, set()):
-            raise DownloaderError("Unknown format. Fetch the video info again, then pick a quality.")
         job_id = str(uuid.uuid4())
 
         with self.jobs_lock:
@@ -256,7 +238,7 @@ class DownloaderService:
         # If user picked a specific format_id, pair it with bestaudio if it lacks audio and ffmpeg exists
         if self.is_ffmpeg_installed():
             # e.g., format_id+bestaudio/best if video-only format is chosen
-            format_spec = f"{format_id}+bestaudio/{format_id}"
+            format_spec = f"{format_id}+bestaudio/bestvideo[format_id={format_id}]+bestaudio/best"
         else:
             format_spec = format_id
 
@@ -266,7 +248,6 @@ class DownloaderService:
             'format': format_spec,
             'outtmpl': outtmpl,
             'progress_hooks': [progress_hook],
-            'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
         }

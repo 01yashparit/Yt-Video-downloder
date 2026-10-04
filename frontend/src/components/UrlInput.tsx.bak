@@ -20,8 +20,9 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onSubmit, isLoading, onToast
     }
     try {
       const parsedUrl = new URL(value.trim());
-      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-        setError('Please enter a link that starts with http:// or https://');
+      const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'];
+      if (!validHosts.includes(parsedUrl.hostname.toLowerCase())) {
+        setError('Please enter a valid YouTube domain URL (e.g. youtube.com or youtu.be)');
         return false;
       }
     } catch {
