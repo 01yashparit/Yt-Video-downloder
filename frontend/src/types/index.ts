@@ -2,11 +2,12 @@ export interface VideoFormat {
   format_id: string;
   extension: string;
   resolution: string;
+  height?: number;
+  fps?: number;
   filesize_approx?: number;
   has_audio: boolean;
   has_video: boolean;
   note?: string;
-  height?: number;
 }
 
 export interface VideoMetadata {
@@ -15,7 +16,7 @@ export interface VideoMetadata {
   url: string;
   thumbnail: string;
   duration: number; // in seconds
-  author?: string;
+  uploader?: string;
   formats: VideoFormat[];
 }
 
