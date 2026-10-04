@@ -1,0 +1,297 @@
+import os
+import re
+import shutil
+import uuid
+import threading
+from urllib.parse import urlparse
+from typing import Dict, Any, List, Optional
+import yt_dlp
+
+from app.utils.config import settings
+from app.utils.logger import logger
+from app.models.schemas import VideoInfoResponse, VideoFormatSchema, DownloadStatusResponse
+
+class DownloaderError(Exception):
+    """Custom exception for downloader service failures."""
+    pass
+
+class DownloaderService:
+    def __init__(self):
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.jobs_lock = threading.Lock()
+        self._ensure_directories()
+
+    def _ensure_directories(self):
+        os.makedirs(settings.DOWNLOAD_DIR, exist_ok=True)
+        os.makedirs(settings.TEMP_DIR, exist_ok=True)
+
+    def is_ffmpeg_installed(self) -> bool:
+        return shutil.which("ffmpeg") is not None
+
+    def validate_url(self, url: str) -> str:
+        if not url or not url.strip():
+            raise DownloaderError("URL cannot be empty.")
+
+        cleaned_url = url.strip()
+        try:
+            parsed = urlparse(cleaned_url)
+            valid_hosts = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+            if parsed.scheme not in ("http", "https"):
+                raise DownloaderError("Invalid URL scheme. Must start with http:// or https://")
+            if parsed.hostname is None or parsed.hostname.lower() not in valid_hosts:
+                raise DownloaderError("Unsupported domain. Only YouTube URLs are supported.")
+        except DownloaderError:
+            raise
+        except Exception as e:
+            raise DownloaderError(f"Invalid URL: {str(e)}")
+
+        return cleaned_url
+
+    def sanitize_filename(self, title: str) -> str:
+        # Replace non-alphanumeric/spaces with underscores or hyphens
+        sanitized = re.sub(r'[^\w\s\-\.\(\)]', '', title)
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        if not sanitized:
+            sanitized = "youtube_download"
+        # Truncate to safe length
+        return sanitized[:150]
+
+    def _get_unique_filepath(self, filename: str, ext: str) -> str:
+        base_path = os.path.join(settings.DOWNLOAD_DIR, f"{filename}.{ext}")
+        if not os.path.exists(base_path):
+            return base_path
+
+        counter = 1
+        while True:
+            candidate = os.path.join(settings.DOWNLOAD_DIR, f"{filename} ({counter}).{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
+    def fetch_video_info(self, url: str) -> VideoInfoResponse:
+        valid_url = self.validate_url(url)
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'skip_download': True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(valid_url, download=False)
+        except Exception as e:
+            err_msg = str(e)
+            logger.error(f"yt-dlp extract_info error for {valid_url}: {err_msg}")
+            if "Private video" in err_msg:
+                raise DownloaderError("This video is private and cannot be downloaded.")
+            elif "Video unavailable" in err_msg:
+                raise DownloaderError("This video is unavailable or has been deleted.")
+            elif "Sign in to confirm your age" in err_msg:
+                raise DownloaderError("This video is age-restricted and requires authentication.")
+            else:
+                raise DownloaderError(f"Failed to fetch video information: {err_msg}")
+
+        if not info:
+            raise DownloaderError("Could not extract metadata for the provided URL.")
+
+        raw_formats = info.get('formats', [])
+        processed_formats: List[VideoFormatSchema] = []
+        seen_resolutions = set()
+
+        # Filter and normalize formats
+        for f in raw_formats:
+            ext = f.get('ext', 'mp4')
+            vcodec = f.get('vcodec', 'none')
+            acodec = f.get('acodec', 'none')
+
+            has_video = vcodec != 'none'
+            has_audio = acodec != 'none'
+
+            if not has_video and not has_audio:
+                continue
+
+            height = f.get('height')
+            format_id = f.get('format_id', '')
+
+            if has_video and height:
+                res_label = f"{height}p"
+                # Deduplicate similar resolutions to keep UI clean, preferring video+audio or higher bitrate
+                key = (res_label, ext, has_audio)
+                if key in seen_resolutions:
+                    continue
+                seen_resolutions.add(key)
+                note = "Video + Audio" if has_audio else "Video only (audio will be merged)"
+            elif has_video and not height:
+                res_label = f.get('format_note', 'Video')
+                note = "Video"
+            else:
+                res_label = "Audio Only"
+                note = f.get('format_note', 'High quality audio')
+
+            filesize = f.get('filesize') or f.get('filesize_approx')
+
+            processed_formats.append(VideoFormatSchema(
+                format_id=format_id,
+                extension=ext,
+                resolution=res_label,
+                height=height,
+                width=f.get('width'),
+                fps=f.get('fps'),
+                vcodec=vcodec if vcodec != 'none' else None,
+                acodec=acodec if acodec != 'none' else None,
+                filesize_approx=filesize,
+                has_audio=has_audio,
+                has_video=has_video,
+                note=note
+            ))
+
+        # Sort formats by height descending, audio at end
+        processed_formats.sort(
+            key=lambda x: (x.has_video, x.height or 0),
+            reverse=True
+        )
+
+        return VideoInfoResponse(
+            id=info.get('id', ''),
+            title=info.get('title', 'Unknown Title'),
+            url=valid_url,
+            thumbnail=info.get('thumbnail', ''),
+            duration=int(info.get('duration') or 0),
+            uploader=info.get('uploader') or info.get('channel'),
+            formats=processed_formats
+        )
+
+    def start_download_job(self, url: str, format_id: str) -> str:
+        valid_url = self.validate_url(url)
+        job_id = str(uuid.uuid4())
+
+        with self.jobs_lock:
+            self.jobs[job_id] = {
+                'job_id': job_id,
+                'status': 'pending',
+                'progress_percentage': 0.0,
+                'downloaded_bytes': 0,
+                'total_bytes': 0,
+                'speed': '0 KB/s',
+                'filename': None,
+                'error': None
+            }
+
+        # Start download in worker thread
+        thread = threading.Thread(
+            target=self._execute_download,
+            args=(job_id, valid_url, format_id),
+            daemon=True
+        )
+        thread.start()
+
+        return job_id
+
+    def get_job_status(self, job_id: str) -> Optional[DownloadStatusResponse]:
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                return None
+            return DownloadStatusResponse(**job)
+
+    def _execute_download(self, job_id: str, url: str, format_id: str):
+        # Update state to downloading
+        with self.jobs_lock:
+            if job_id in self.jobs:
+                self.jobs[job_id]['status'] = 'downloading'
+
+        def progress_hook(d):
+            if d.get('status') == 'downloading':
+                downloaded = d.get('downloaded_bytes', 0)
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                speed_bytes = d.get('speed') or 0
+
+                percent = 0.0
+                if total > 0:
+                    percent = round((downloaded / total) * 100, 1)
+
+                speed_str = "0 KB/s"
+                if speed_bytes:
+                    if speed_bytes >= 1024 * 1024:
+                        speed_str = f"{speed_bytes / (1024 * 1024):.1f} MB/s"
+                    else:
+                        speed_str = f"{speed_bytes / 1024:.1f} KB/s"
+
+                with self.jobs_lock:
+                    if job_id in self.jobs:
+                        self.jobs[job_id]['progress_percentage'] = percent
+                        self.jobs[job_id]['downloaded_bytes'] = downloaded
+                        self.jobs[job_id]['total_bytes'] = total
+                        self.jobs[job_id]['speed'] = speed_str
+
+            elif d.get('status') == 'finished':
+                with self.jobs_lock:
+                    if job_id in self.jobs:
+                        self.jobs[job_id]['status'] = 'processing'
+                        self.jobs[job_id]['progress_percentage'] = 99.0
+
+        # Determine best format specifier for yt-dlp
+        # If user picked a specific format_id, pair it with bestaudio if it lacks audio and ffmpeg exists
+        if self.is_ffmpeg_installed():
+            # e.g., format_id+bestaudio/best if video-only format is chosen
+            format_spec = f"{format_id}+bestaudio/bestvideo[format_id={format_id}]+bestaudio/best"
+        else:
+            format_spec = format_id
+
+        outtmpl = os.path.join(settings.TEMP_DIR, f"{job_id}_%(title)s.%(ext)s")
+
+        ydl_opts = {
+            'format': format_spec,
+            'outtmpl': outtmpl,
+            'progress_hooks': [progress_hook],
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                downloaded_file = ydl.prepare_filename(info)
+
+            # Move file from temp to downloads directory with safe unique filename
+            title = info.get('title', 'downloaded_video')
+            ext = info.get('ext', 'mp4')
+            safe_title = self.sanitize_filename(title)
+            final_path = self._get_unique_filepath(safe_title, ext)
+
+            if os.path.exists(downloaded_file):
+                shutil.move(downloaded_file, final_path)
+            else:
+                # Handle possible merged file extension change by yt-dlp/ffmpeg
+                base_temp_path = os.path.splitext(downloaded_file)[0]
+                found = False
+                for f in os.listdir(settings.TEMP_DIR):
+                    if f.startswith(os.path.basename(base_temp_path)):
+                        actual_temp = os.path.join(settings.TEMP_DIR, f)
+                        actual_ext = os.path.splitext(f)[1].lstrip('.')
+                        final_path = self._get_unique_filepath(safe_title, actual_ext)
+                        shutil.move(actual_temp, final_path)
+                        found = True
+                        break
+                if not found:
+                    raise DownloaderError("Downloaded output file could not be located.")
+
+            final_filename = os.path.basename(final_path)
+
+            with self.jobs_lock:
+                if job_id in self.jobs:
+                    self.jobs[job_id]['status'] = 'completed'
+                    self.jobs[job_id]['progress_percentage'] = 100.0
+                    self.jobs[job_id]['filename'] = final_filename
+
+        except Exception as e:
+            err_msg = str(e)
+            logger.error(f"Download execution failed for job {job_id}: {err_msg}")
+            with self.jobs_lock:
+                if job_id in self.jobs:
+                    self.jobs[job_id]['status'] = 'failed'
+                    self.jobs[job_id]['error'] = err_msg
+
+downloader_service = DownloaderService()
